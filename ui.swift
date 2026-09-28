@@ -498,5 +498,20 @@ struct LockinApp: App {
             ContentView()
         }
         .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About Lockin") {
+                    let text = NSMutableAttributedString(string: "By Lucas H\n\n")
+                    let link = NSAttributedString(string: "GitHub Repository", attributes: [
+                        .link: URL(string: "https://github.com/sigma-prog/lockin")!,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue
+                    ])
+                    text.append(link)
+                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                        .credits: text
+                    ])
+                }
+            }
+        }
     }
 }
