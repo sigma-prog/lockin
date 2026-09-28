@@ -181,14 +181,23 @@ struct ContentView: View {
     @State private var remainingSeconds: Int = 0
     @State private var sessionStartSeconds: Int = 0
 
-    // Blocklist state
+    // Blocklist state loaded from UserDefaults
     @State private var showBlocklist: Bool = false
-    @State private var listMode: ListMode = .blocklist
-    @State private var selectedApps: [String] = ["Discord", "Google Chrome", "Spotify"]
+    @State private var listMode: ListMode = {
+        if let raw = UserDefaults.standard.string(forKey: "lockin_mode"), let m = ListMode(rawValue: raw) {
+            return m
+        }
+        return .blocklist
+    }()
+    @State private var selectedApps: [String] = {
+        if let saved = UserDefaults.standard.stringArray(forKey: "lockin_apps") {
+            return saved
+        }
+        return ["Discord", "Google Chrome", "Spotify"]
+    }()
 
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    // SelfControl-style dynamic summary
     var statusSummary: String {
         let prefix = listMode == .blocklist ? "Blocking" : "Only allowing"
 
@@ -282,15 +291,27 @@ struct ContentView: View {
                     .padding(.top, 2)
                 }
 
-                // Middle: Setup Mode vs Countdown Mode
+                // Middle: Setup Mode vs Refined Countdown Mode
                 VStack(alignment: .leading, spacing: 6) {
                     if isLocked {
                         Text(formattedCountdown)
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .font(.system(size: 13, weight: .regular))
+                            .monospacedDigit()
                             .foregroundColor(Color(red: 0.15, green: 0.15, blue: 0.15))
 
-                        ProgressView(value: Double(remainingSeconds), total: Double(max(sessionStartSeconds, 1)))
-                            .tint(Color(red: 0.25, green: 0.25, blue: 0.25))
+                        // Clean, thin progress track (matching slider track)
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(Color.gray.opacity(0.25))
+                                    .frame(height: 4)
+
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(Color(red: 0.25, green: 0.25, blue: 0.25))
+                                    .frame(width: geo.size.width * CGFloat(Double(remainingSeconds) / Double(max(sessionStartSeconds, 1))), height: 4)
+                            }
+                        }
+                        .frame(height: 20)
                     } else {
                         HStack(spacing: 6) {
                             HStack(spacing: 4) {
@@ -370,6 +391,13 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showBlocklist) {
             BlocklistSheet(isPresented: $showBlocklist, mode: $listMode, apps: $selectedApps)
+        }
+        // Save to UserDefaults automatically whenever apps or mode change
+        .onChange(of: selectedApps) { _, newApps in
+            UserDefaults.standard.set(newApps, forKey: "lockin_apps")
+        }
+        .onChange(of: listMode) { _, newMode in
+            UserDefaults.standard.set(newMode.rawValue, forKey: "lockin_mode")
         }
         .onReceive(timer) { _ in
             if isLocked && remainingSeconds > 0 {
