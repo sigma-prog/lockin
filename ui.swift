@@ -50,7 +50,6 @@ struct ContentView: View {
     }
 
     func stopEditing() {
-        // Fall back to 0 if left empty
         if hoursText.trimmingCharacters(in: .whitespaces).isEmpty {
             hoursText = "0"
         }
@@ -101,7 +100,7 @@ struct ContentView: View {
                                     .textFieldStyle(.plain)
                                     .multilineTextAlignment(.center)
                                     .font(.system(size: 12, weight: .medium))
-                                    .onChange(of: hoursText) { newVal in
+                                    .onChange(of: hoursText) { _, newVal in
                                         hoursText = cleanNumbers(newVal)
                                         validateAndUpdate()
                                     }
@@ -142,7 +141,7 @@ struct ContentView: View {
                                     .textFieldStyle(.plain)
                                     .multilineTextAlignment(.center)
                                     .font(.system(size: 12, weight: .medium))
-                                    .onChange(of: minsText) { newVal in
+                                    .onChange(of: minsText) { _, newVal in
                                         minsText = cleanNumbers(newVal)
                                         validateAndUpdate()
                                     }
@@ -188,7 +187,7 @@ struct ContentView: View {
                 // Smooth full-width slider
                 Slider(value: $totalMinutes, in: 5...720)
                     .accentColor(Color(red: 0.25, green: 0.25, blue: 0.25))
-                    .onChange(of: totalMinutes) { val in
+                    .onChange(of: totalMinutes) { _, val in
                         syncFromSlider(val: val)
                     }
             }
@@ -227,7 +226,6 @@ struct ContentView: View {
         .padding(.vertical, 14)
         .frame(width: 480, height: 155)
         .background(Color(red: 0.90, green: 0.90, blue: 0.91))
-        // Click outside the box to finish typing
         .contentShape(Rectangle())
         .onTapGesture {
             stopEditing()
