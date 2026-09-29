@@ -36,6 +36,7 @@
 
 1. Download **`Lockin.app.zip`** from the [Latest Release](https://github.com/sigma-prog/lockin/releases).
 2. Follow the instructions
+
 This is only for m series chips. Not intel. For intel, compile it yourself.
 
 ## 🔨 Building from Source
