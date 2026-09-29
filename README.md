@@ -14,6 +14,11 @@
 </div>
 
 ---
+
+# Demo
+
+<img width="2460" height="1730" alt="blocker demo" src="https://github.com/user-attachments/assets/04bb3cd5-32fa-47fb-8a8d-d01ebb0cb967" />
+
 ## ⚡ How Lockin Compares
 
 | Feature | **Lockin** | **Cold Turkey** | **Freedom** | **Opal** |
@@ -56,7 +61,7 @@ Click **Allow**. This enables Lockin to inspect tab URLs and close blacklisted d
 
 ---
 
-## 📄 License
+## License
 
 This project is open-source under the [MIT License](LICENSE).
 
