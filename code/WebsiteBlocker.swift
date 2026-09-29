@@ -31,7 +31,7 @@ class WebsiteBlocker {
                 repeat with t in (tabs of w)
                     try
                         set currentURL to URL of t
-                        if \(check) then close t
+                        if \(check) then tell w to close t
                     end try
                 end repeat
             end repeat
@@ -50,7 +50,7 @@ class WebsiteBlocker {
                 repeat with t in (tabs of w)
                     try
                         set tabURL to URL of t
-                        if \(check) then close t
+                        if \(check) then tell w to close t
                     end try
                 end repeat
             end repeat

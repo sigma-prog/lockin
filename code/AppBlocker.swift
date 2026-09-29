@@ -10,19 +10,16 @@ enum ListMode: String, CaseIterable {
 class AppBlocker {
     static let shared = AppBlocker()
 
-    // Allow these
+    // never blocked
     private let safeSystemApps: Set<String> = [
-    "finder",          
-    "terminal",        
-    "iterm2",        
-    "system settings",  
-]
+        "finder", "terminal", "system settings"
+    ]
 
     func enforce(mode: ListMode, apps: [String]) {
         let currentPID = ProcessInfo.processInfo.processIdentifier
         let appSet = Set(apps.map { $0.lowercased().trimmingCharacters(in: .whitespaces) })
 
-        // Never kill all apps if the Allowlist is empty
+        // Failsafe: Never kill all apps if the Allowlist is empty
         if mode == .allowlist && appSet.isEmpty {
             return
         }

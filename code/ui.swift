@@ -15,10 +15,8 @@ func getMonotonicTime() -> Double {
 class PersistenceManager {
     static let label = "com.lockin.app"
 
-    static func ensureInstalledAndSupervised() -> Bool {
-        if getppid() == 1 { return true }
-
-        guard let execPath = Bundle.main.executablePath ?? CommandLine.arguments.first else { return false }
+    static func installSupervisor() {
+        guard let execPath = Bundle.main.executablePath ?? CommandLine.arguments.first else { return }
         let fullPath = execPath.hasPrefix("/") ? execPath : URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(execPath).standardized.path
 
         let launchAgentsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
@@ -39,10 +37,7 @@ class PersistenceManager {
             <key>RunAtLoad</key>
             <true/>
             <key>KeepAlive</key>
-            <dict>
-                <key>SuccessfulExit</key>
-                <false/>
-            </dict>
+            <true/>
             <key>ThrottleInterval</key>
             <integer>1</integer>
         </dict>
@@ -57,14 +52,19 @@ class PersistenceManager {
         bootstrap.arguments = ["bootstrap", "gui/\(uid)", plistURL.path]
         try? bootstrap.run()
         bootstrap.waitUntilExit()
+    }
 
-        let kickstart = Process()
-        kickstart.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        kickstart.arguments = ["kickstart", "-k", "gui/\(uid)/\(label)"]
-        try? kickstart.run()
-        kickstart.waitUntilExit()
+    static func removeSupervisor() {
+        let uid = "\(getuid())"
+        let bootout = Process()
+        bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        bootout.arguments = ["bootout", "gui/\(uid)/\(label)"]
+        try? bootout.run()
+        bootout.waitUntilExit()
 
-        return false
+        let launchAgentsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
+        let plistURL = launchAgentsDir.appendingPathComponent("\(label).plist")
+        try? FileManager.default.removeItem(at: plistURL)
     }
 }
 
@@ -150,17 +150,14 @@ class BlockerEngine {
     static let shared = BlockerEngine()
     private var timer: Timer?
     private(set) var isRunning = false
-    private let queue = DispatchQueue(label: "com.lockin.engine", qos: .userInitiated)
 
     func start(mode: ListMode, apps: [String], siteMode: ListMode, sites: [String]) {
         stop()
         isRunning = true
         let tick = { [weak self] in
             guard let self = self, self.isRunning else { return }
-            self.queue.async {
-                AppBlocker.shared.enforce(mode: mode, apps: apps)
-                WebsiteBlocker.shared.enforce(mode: siteMode, domains: sites)
-            }
+            AppBlocker.shared.enforce(mode: mode, apps: apps)
+            WebsiteBlocker.shared.enforce(mode: siteMode, domains: sites)
         }
         tick()
         DispatchQueue.main.async {
@@ -293,7 +290,6 @@ struct ContentView: View {
         return h > 0 ? String(format: "%d hr %02d min %02d sec remaining", h, m, s) : String(format: "%02d min %02d sec remaining", m, s)
     }
 
-    // Progress fraction strictly clamped to 0.0 ... 1.0 (never blows up or breaks)
     var progressFraction: CGFloat {
         guard sessionStartSeconds > 0 else { return 0 }
         let fraction = CGFloat(Double(remainingSeconds) / Double(sessionStartSeconds))
@@ -322,7 +318,6 @@ struct ContentView: View {
         let nowMono = getMonotonicTime()
         targetMonotonicTime = nowMono + Double(secs)
 
-        // Store session state
         UserDefaults.standard.set(true, forKey: "lockin_is_locked")
         UserDefaults.standard.set(targetMonotonicTime, forKey: "lockin_target_mono")
         UserDefaults.standard.set(secs, forKey: "lockin_total_sec")
@@ -331,6 +326,8 @@ struct ContentView: View {
         remainingSeconds = secs
         sessionStartSeconds = secs
         isLocked = true
+
+        PersistenceManager.installSupervisor()
         BlockerEngine.shared.start(mode: listMode, apps: selectedApps, siteMode: websiteMode, sites: blockedDomains)
     }
 
@@ -351,7 +348,9 @@ struct ContentView: View {
         UserDefaults.standard.removeObject(forKey: "lockin_target_mono")
         UserDefaults.standard.removeObject(forKey: "lockin_total_sec")
         UserDefaults.standard.removeObject(forKey: "lockin_wall_end")
-        BlockerEngine.shared.stop() // Immediately stops blocking apps and tabs
+        
+        PersistenceManager.removeSupervisor()
+        BlockerEngine.shared.stop()
     }
 
     func checkActiveSession() {
@@ -364,10 +363,8 @@ struct ContentView: View {
         let savedMono = UserDefaults.standard.double(forKey: "lockin_target_mono")
         let nowMono = getMonotonicTime()
 
-        // Check monotonic time first (immune to system settings clock change)
         var left = Int(savedMono - nowMono)
 
-        // If the machine rebooted, monotonic clock reset to 0; recover via wall clock
         if left < 0 || nowMono < (savedMono - Double(max(savedTotal, 1) + 3600)) {
             let wallEnd = UserDefaults.standard.double(forKey: "lockin_wall_end")
             left = Int(wallEnd - Date().timeIntervalSince1970)
@@ -379,8 +376,9 @@ struct ContentView: View {
 
         if left > 0 {
             remainingSeconds = left
-            sessionStartSeconds = max(savedTotal, left) // Restores total duration properly
+            sessionStartSeconds = max(savedTotal, left)
             isLocked = true
+            PersistenceManager.installSupervisor()
             BlockerEngine.shared.start(mode: listMode, apps: selectedApps, siteMode: websiteMode, sites: blockedDomains)
         } else {
             endSession()
@@ -474,7 +472,7 @@ struct ContentView: View {
             if diff > 0 {
                 remainingSeconds = diff
             } else {
-                endSession() // Cleans up and stops all blockers immediately
+                endSession()
             }
         }
     }
@@ -486,9 +484,6 @@ struct LockinApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     init() {
-        if !PersistenceManager.ensureInstalledAndSupervised() {
-            exit(0)
-        }
         NSApplication.shared.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
