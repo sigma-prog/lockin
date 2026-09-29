@@ -484,6 +484,26 @@ struct LockinApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     init() {
+        // Single-Instance Guard: Prevents duplicate windows
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.lockin.app"
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != myPID }
+
+        if let existing = others.first {
+            if getppid() == 1 {
+                // This instance was launched by launchd to supervise:
+                // Kill the old un-supervised window so only this one remains!
+                for other in others {
+                    other.forceTerminate()
+                }
+            } else {
+                // User accidentally opened a second copy: focus the existing one and exit
+                existing.activate()
+                exit(0)
+            }
+        }
+
         NSApplication.shared.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
