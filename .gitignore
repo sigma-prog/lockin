@@ -3,3 +3,7 @@ Lockin.app
 build/
 *.iconset
 .DS_Store
+Lockin.app/
+code/Lockin
+*.zip
+.DS_Store

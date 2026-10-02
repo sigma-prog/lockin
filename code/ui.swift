@@ -3,125 +3,169 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 import Darwin
+import CryptoKit
 
-// Time checking
+// Shared constants
+private let defaults = UserDefaults.standard
+private enum Key {
+    static let appMode = "lockin_mode", siteMode = "lockin_website_mode", apps = "lockin_apps", domains = "lockin_blocked_domains"
+}
+private enum Limits { static let maxSeconds = 43_200, extensionSeconds = 900 }
+private enum Palette {
+    static let background = Color(red: 0.90, green: 0.90, blue: 0.91), textDark = Color(red: 0.15, green: 0.15, blue: 0.15)
+    static let textLabel = Color(red: 0.20, green: 0.20, blue: 0.20), bar = Color(red: 0.25, green: 0.25, blue: 0.25)
+    static let summary = Color(red: 0.35, green: 0.35, blue: 0.35)
+}
+// Authoritative lock state lives in memory, so editing saved preferences can't unlock a running session
+private var sessionIsLocked = false
+
+// clock that keeps counting through sleep, so changing the system time can't cheat the timer
 func getMonotonicTime() -> Double {
     var info = mach_timebase_info()
     mach_timebase_info(&info)
     return (Double(mach_continuous_time()) * Double(info.numer) / Double(info.denom)) / 1_000_000_000.0
 }
 
-// Open back up 
-class PersistenceManager {
+private struct SessionRecord: Codable {
+    var targetMono: Double
+    var wallEnd: Double
+    var total: Int
+    var config: BlockConfig
+}
+
+private enum SessionStore {
+    private static let secret = SymmetricKey(data: Data(("lockin.session.v1." + NSUserName() + ".7f3a9c1e").utf8))
+    private static let defaultsKey = "lockin_session_v1"
+    private static let fm = FileManager.default
+    private static let tagLength = 32
+
+    private static var fileURLs: [URL] {
+        let home = fm.homeDirectoryForCurrentUser
+        return [home.appendingPathComponent("Library/Application Support/Lockin/.session"),
+                home.appendingPathComponent("Library/Caches/com.lockin.cache/.state")]
+    }
+
+    private static func tag(for payload: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: payload, using: secret))
+    }
+
+    private static func decode(_ data: Data) -> SessionRecord? {
+        guard data.count > tagLength else { return nil }
+        let payload = Data(data.prefix(data.count - tagLength))
+        guard Data(data.suffix(tagLength)) == tag(for: payload) else { return nil }
+        return try? JSONDecoder().decode(SessionRecord.self, from: payload)
+    }
+
+    static func save(_ record: SessionRecord) {
+        guard let payload = try? JSONEncoder().encode(record) else { return }
+        let blob = payload + tag(for: payload)
+        defaults.set(blob, forKey: defaultsKey)
+        for url in fileURLs {
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? blob.write(to: url, options: .atomic)
+        }
+    }
+
+    static func load() -> SessionRecord? {
+        var blobs: [Data] = []
+        if let d = defaults.data(forKey: defaultsKey) { blobs.append(d) }
+        blobs += fileURLs.compactMap { try? Data(contentsOf: $0) }
+        return blobs.compactMap(decode).max { $0.wallEnd < $1.wallEnd }
+    }
+
+    static func clear() {
+        defaults.removeObject(forKey: defaultsKey)
+        fileURLs.forEach { try? fm.removeItem(at: $0) }
+    }
+}
+
+// Persistence
+enum PersistenceManager {
     static let label = "com.lockin.app"
+    private static let fm = FileManager.default
+    private static var serviceTarget: String { "gui/\(getuid())/\(label)" }
+    private static var plistURL: URL { fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist") }
+
+    @discardableResult
+    private static func launchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
 
     static func installSupervisor() {
         guard let execPath = Bundle.main.executablePath ?? CommandLine.arguments.first else { return }
-        let fullPath = execPath.hasPrefix("/") ? execPath : URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(execPath).standardized.path
+        let fullPath = execPath.hasPrefix("/") ? execPath
+            : URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent(execPath).standardized.path
+        try? fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        let launchAgentsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
-        let plistURL = launchAgentsDir.appendingPathComponent("\(label).plist")
-        try? FileManager.default.createDirectory(at: launchAgentsDir, withIntermediateDirectories: true)
-
-        let plistContent = """
+        let plist = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
         <dict>
-            <key>Label</key>
-            <string>\(label)</string>
-            <key>ProgramArguments</key>
-            <array>
-                <string>\(fullPath)</string>
-            </array>
-            <key>RunAtLoad</key>
-            <true/>
-            <key>KeepAlive</key>
-            <true/>
-            <key>ThrottleInterval</key>
-            <integer>1</integer>
+            <key>Label</key><string>\(label)</string>
+            <key>ProgramArguments</key><array><string>\(fullPath)</string></array>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+            <key>ThrottleInterval</key><integer>1</integer>
         </dict>
         </plist>
         """
+        try? plist.write(to: plistURL, atomically: true, encoding: .utf8)
 
-        try? plistContent.write(to: plistURL, atomically: true, encoding: .utf8)
-        let uid = "\(getuid())"
-
-        let bootstrap = Process()
-        bootstrap.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        bootstrap.arguments = ["bootstrap", "gui/\(uid)", plistURL.path]
-        try? bootstrap.run()
-        bootstrap.waitUntilExit()
+        if launchctl(["print", serviceTarget]) != 0 {
+            launchctl(["bootstrap", "gui/\(getuid())", plistURL.path])   // first time: load and start
+        } else {
+            launchctl(["kickstart", serviceTarget])                       // already loaded: start it if it isn't running
+        }
     }
 
     static func removeSupervisor() {
-        let uid = "\(getuid())"
-        let bootout = Process()
-        bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        bootout.arguments = ["bootout", "gui/\(uid)/\(label)"]
-        try? bootout.run()
-        bootout.waitUntilExit()
-
-        let launchAgentsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
-        let plistURL = launchAgentsDir.appendingPathComponent("\(label).plist")
-        try? FileManager.default.removeItem(at: plistURL)
+        try? fm.removeItem(at: plistURL)
     }
 }
 
-// Intercepter
+// App delegate (blocks Cmd+Q and quitting while locked)
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers?.lowercased() == "q" {
-                if UserDefaults.standard.bool(forKey: "lockin_is_locked") {
-                    NSSound.beep()
-                    return nil
-                }
-            }
+            let isCmdQ = event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers?.lowercased() == "q"
+            if isCmdQ && sessionIsLocked { NSSound.beep(); return nil }
             return event
         }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            for window in sender.windows {
-                window.makeKeyAndOrderFront(self)
-            }
-        }
+        if !flag { sender.windows.forEach { $0.makeKeyAndOrderFront(self) } }
         return true
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if UserDefaults.standard.bool(forKey: "lockin_is_locked") {
-            NSSound.beep()
-            return .terminateCancel
-        }
+        if sessionIsLocked { NSSound.beep(); return .terminateCancel }
         return .terminateNow
     }
 }
-
-// Removes close button
+/// Disables the close/minimize buttons while a session is locked
 struct WindowAccessor: NSViewRepresentable {
     var isLocked: Bool
-
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async { update(view.window) }
         return view
     }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        update(nsView.window)
-    }
-
+    func updateNSView(_ nsView: NSView, context: Context) { update(nsView.window) }
     private func update(_ window: NSWindow?) {
-        guard let window = window else { return }
-        window.standardWindowButton(.closeButton)?.isEnabled = !isLocked
-        window.standardWindowButton(.miniaturizeButton)?.isEnabled = !isLocked
+        window?.standardWindowButton(.closeButton)?.isEnabled = !isLocked
+        window?.standardWindowButton(.miniaturizeButton)?.isEnabled = !isLocked
     }
 }
 
-// Button Style and Engine
 struct HoverBtn: ButtonStyle {
     var disabled = false
     var w: CGFloat? = nil
@@ -131,56 +175,87 @@ struct HoverBtn: ButtonStyle {
     @State private var hovered = false
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
+        let active = hovered && !disabled
+        return configuration.label
             .font(.system(size: size, weight: bold ? .semibold : .medium))
             .foregroundColor(disabled ? .secondary : (hovered ? .black : .primary))
             .frame(width: w, height: h)
-            .padding(.horizontal, w == nil ? 8 : 0)
-            .padding(.vertical, h == nil ? 3 : 0)
+            .padding(.horizontal, w == nil ? 8 : 0).padding(.vertical, h == nil ? 3 : 0)
             .background(Color.white.opacity(disabled ? 0.45 : (hovered ? 1.0 : 0.92)))
             .cornerRadius(5)
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(hovered && !disabled ? Color.gray.opacity(0.6) : Color.gray.opacity(0.3), lineWidth: 1))
-            .shadow(color: .black.opacity(hovered && !disabled ? 0.08 : 0.03), radius: hovered ? 2 : 1, y: 1)
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.gray.opacity(active ? 0.6 : 0.3), lineWidth: 1))
+            .shadow(color: .black.opacity(active ? 0.08 : 0.03), radius: hovered ? 2 : 1, y: 1)
             .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
             .onHover { if !disabled { hovered = $0 } }
     }
 }
 
+// Blocker engine
+struct BlockConfig: Codable {
+    var appMode: ListMode
+    var apps: [String]
+    var siteMode: ListMode
+    var sites: [String]
+}
+
 class BlockerEngine {
     static let shared = BlockerEngine()
-    private var timer: Timer?
+    private var timers: [Timer] = []
+    private var launchObserver: NSObjectProtocol?
     private(set) var isRunning = false
 
-    func start(mode: ListMode, apps: [String], siteMode: ListMode, sites: [String]) {
+    func start(_ config: BlockConfig) {
         stop()
         isRunning = true
-        let tick = { [weak self] in
-            guard let self = self, self.isRunning else { return }
-            AppBlocker.shared.enforce(mode: mode, apps: apps)
-            WebsiteBlocker.shared.enforce(mode: siteMode, domains: sites)
-        }
-        tick()
-        DispatchQueue.main.async {
-            self.timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in tick() }
+        AppBlocker.shared.configure(mode: config.appMode, apps: config.apps, blockUnfilterableBrowsers: !config.sites.isEmpty)
+        WebsiteBlocker.shared.configure(mode: config.siteMode, domains: config.sites)
+        AppBlocker.shared.enforce()
+        WebsiteBlocker.shared.enforce()
+
+        schedule(every: 2) { AppBlocker.shared.enforce() }     
+        schedule(every: 1) { WebsiteBlocker.shared.enforce() }
+
+
+        launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            guard self?.isRunning == true,
+                  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            AppBlocker.shared.check(app)
         }
     }
 
     func stop() {
         isRunning = false
-        timer?.invalidate()
-        timer = nil
+        timers.forEach { $0.invalidate() }
+        timers.removeAll()
+        if let observer = launchObserver { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        launchObserver = nil
+    }
+
+    private func schedule(every interval: TimeInterval, _ work: @escaping () -> Void) {
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            guard self?.isRunning == true else { return }
+            work()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        timers.append(timer)
     }
 }
 
-// stuff
 struct AppIconView: View {
     let appName: String
-    var body: some View {
-        let paths = ["/Applications", "/System/Applications", "/System/Applications/Utilities", NSHomeDirectory() + "/Applications"].map { "\($0)/\(appName).app" }
-        let path = paths.first { FileManager.default.fileExists(atPath: $0) }
-        let icon = path != nil ? NSWorkspace.shared.icon(forFile: path!) : NSWorkspace.shared.icon(for: .application)
-        Image(nsImage: icon).resizable().frame(width: 18, height: 18)
+    private static let searchDirs = ["/Applications", "/System/Applications", "/System/Applications/Utilities", NSHomeDirectory() + "/Applications"]
+    private static var cache: [String: NSImage] = [:]
+
+    private static func icon(for name: String) -> NSImage {
+        if let cached = cache[name] { return cached }
+        let path = searchDirs.map { "\($0)/\(name).app" }.first { FileManager.default.fileExists(atPath: $0) }
+        let image = path.map { NSWorkspace.shared.icon(forFile: $0) } ?? NSWorkspace.shared.icon(for: .application)
+        cache[name] = image
+        return image
     }
+
+    var body: some View { Image(nsImage: Self.icon(for: appName)).resizable().frame(width: 18, height: 18) }
 }
 
 struct TimeBox: View {
@@ -207,20 +282,36 @@ struct ListEditorSheet: View {
     @Binding var isPresented: Bool
     @Binding var mode: ListMode
     @Binding var items: [String]
-    var isWeb: Bool = false
+    var isWeb = false
     var onSave: () -> Void
-
     @State private var input = ""
 
-    func addItem(_ val: String) {
-        let clean = isWeb ? val.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "https://", with: "").replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: "www.", with: "").lowercased() : val
-        if !clean.isEmpty && !items.contains(clean) { items.append(clean); input = ""; onSave() }
+    private func addItem(_ value: String) {
+        let clean = isWeb
+            ? value.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "https://", with: "")
+                .replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: "www.", with: "").lowercased()
+            : value
+        guard !clean.isEmpty, !items.contains(clean) else { return }
+        items.append(clean); input = ""; onSave()
     }
 
-    func pickApp() {
-        let p = NSOpenPanel()
-        p.allowedContentTypes = [.application]; p.directoryURL = URL(fileURLWithPath: "/Applications"); p.allowsMultipleSelection = true
-        if p.runModal() == .OK { p.urls.forEach { addItem($0.deletingPathExtension().lastPathComponent) } }
+    private func pickApp() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK { panel.urls.forEach { addItem($0.deletingPathExtension().lastPathComponent) } }
+    }
+
+    private func row(for item: String) -> some View {
+        HStack(spacing: 8) {
+            if isWeb { Image(systemName: "globe").font(.system(size: 12)).foregroundColor(.secondary) } else { AppIconView(appName: item) }
+            Text(item).font(.system(size: 12))
+            Spacer()
+            Button { items.removeAll { $0 == item }; onSave() } label: {
+                Image(systemName: "trash").font(.system(size: 10)).foregroundColor(.red.opacity(0.8))
+            }.buttonStyle(.plain)
+        }
     }
 
     var body: some View {
@@ -233,20 +324,14 @@ struct ListEditorSheet: View {
             if isWeb {
                 HStack(spacing: 8) {
                     TextField(placeholder, text: $input).textFieldStyle(.roundedBorder).font(.system(size: 12)).onSubmit { addItem(input) }
-                    Button("Add") { addItem(input) }.buttonStyle(.bordered).controlSize(.small).disabled(input.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Add") { addItem(input) }.buttonStyle(.bordered).controlSize(.small)
+                        .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
 
             List {
                 if items.isEmpty { Text("No items added yet.").font(.system(size: 11)).foregroundColor(.secondary).padding(.vertical, 8) }
-                ForEach(items, id: \.self) { item in
-                    HStack(spacing: 8) {
-                        if isWeb { Image(systemName: "globe").font(.system(size: 12)).foregroundColor(.secondary) } else { AppIconView(appName: item) }
-                        Text(item).font(.system(size: 12))
-                        Spacer()
-                        Button { items.removeAll { $0 == item }; onSave() } label: { Image(systemName: "trash").font(.system(size: 10)).foregroundColor(.red.opacity(0.8)) }.buttonStyle(.plain)
-                    }
-                }
+                ForEach(items, id: \.self) { row(for: $0) }
             }.listStyle(.inset).frame(height: 140).cornerRadius(6)
 
             HStack {
@@ -254,279 +339,261 @@ struct ListEditorSheet: View {
                 Spacer()
                 Button("Done") { isPresented = false }.buttonStyle(.borderedProminent).controlSize(.small)
             }
-        }.padding(16).frame(width: 360, height: isWeb ? 315 : 270).background(Color(NSColor.windowBackgroundColor))
+        }
+        .padding(16).frame(width: 360, height: isWeb ? 315 : 270).background(Color(NSColor.windowBackgroundColor))
     }
 }
 
-// Main View
+// Main view
 struct ContentView: View {
     @State private var totalMinutes: Double = 90
-    @State private var hoursText: String = "1"
-    @State private var minsText: String = "30"
+    @State private var hoursText = "1"
+    @State private var minsText = "30"
     @State private var errorMessage: String? = nil
-    @State private var isLocked: Bool = false
-    @State private var remainingSeconds: Int = 0
-    @State private var sessionStartSeconds: Int = 1
+    @State private var isLocked = false
+    @State private var remainingSeconds = 0
+    @State private var sessionStartSeconds = 1
     @State private var targetMonotonicTime: Double = 0
-    @State private var showApps: Bool = false
-    @State private var showSites: Bool = false
+    @State private var wallEndTime: Double = 0
+    @State private var lockedConfig = BlockConfig(appMode: .blocklist, apps: [], siteMode: .blocklist, sites: [])
+    @State private var ticks = 0
+    @State private var showApps = false
+    @State private var showSites = false
+    @State private var listMode = ListMode(rawValue: defaults.string(forKey: Key.appMode) ?? "") ?? .blocklist
+    @State private var websiteMode = ListMode(rawValue: defaults.string(forKey: Key.siteMode) ?? "") ?? .blocklist
+    @State private var selectedApps = defaults.stringArray(forKey: Key.apps) ?? []
+    @State private var blockedDomains = defaults.stringArray(forKey: Key.domains) ?? []
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    @State private var listMode: ListMode = ListMode(rawValue: UserDefaults.standard.string(forKey: "lockin_mode") ?? "") ?? .blocklist
-    @State private var websiteMode: ListMode = ListMode(rawValue: UserDefaults.standard.string(forKey: "lockin_website_mode") ?? "") ?? .blocklist
-    @State private var selectedApps: [String] = UserDefaults.standard.stringArray(forKey: "lockin_apps") ?? []
-    @State private var blockedDomains: [String] = UserDefaults.standard.stringArray(forKey: "lockin_blocked_domains") ?? []
+    private var config: BlockConfig { BlockConfig(appMode: listMode, apps: selectedApps, siteMode: websiteMode, sites: blockedDomains) }
 
-    let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    var statusSummary: String {
-        let fmt = { (list: [String], mode: ListMode, def: String) in
-            list.isEmpty ? (mode == .blocklist ? "none" : def) : (list.count <= 2 ? list.joined(separator: ", ") : "\(list.prefix(2).joined(separator: ", ")), +\(list.count - 2)")
-        }
-        return "\(listMode == .blocklist ? "Blocking" : "Allowing") apps: \(fmt(selectedApps, listMode, "Safari & Chrome only"))  •  \(websiteMode == .blocklist ? "Blocking" : "Allowing") sites: \(fmt(blockedDomains, websiteMode, "none"))"
+    private func summarize(_ list: [String], _ mode: ListMode, _ emptyAllow: String) -> String {
+        if list.isEmpty { return mode == .blocklist ? "none" : emptyAllow }
+        return list.count <= 2 ? list.joined(separator: ", ") : "\(list.prefix(2).joined(separator: ", ")), +\(list.count - 2)"
     }
 
-    var countdownStr: String {
+    private var statusSummary: String {
+        let verb = { (m: ListMode) in m == .blocklist ? "Blocking" : "Allowing" }
+        return "\(verb(listMode)) apps: \(summarize(selectedApps, listMode, "no restrictions"))  •  \(verb(websiteMode)) sites: \(summarize(blockedDomains, websiteMode, "no restrictions"))"
+    }
+
+    private var countdownStr: String {
         let h = remainingSeconds / 3600, m = (remainingSeconds % 3600) / 60, s = remainingSeconds % 60
         return h > 0 ? String(format: "%d hr %02d min %02d sec remaining", h, m, s) : String(format: "%02d min %02d sec remaining", m, s)
     }
 
-    var progressFraction: CGFloat {
+    private var progressFraction: CGFloat {
         guard sessionStartSeconds > 0 else { return 0 }
-        let fraction = CGFloat(Double(remainingSeconds) / Double(sessionStartSeconds))
-        return min(max(fraction, 0.0), 1.0)
+        return min(max(CGFloat(Double(remainingSeconds) / Double(sessionStartSeconds)), 0), 1)
     }
 
-    func save() {
-        UserDefaults.standard.set(selectedApps, forKey: "lockin_apps")
-        UserDefaults.standard.set(listMode.rawValue, forKey: "lockin_mode")
-        UserDefaults.standard.set(blockedDomains, forKey: "lockin_blocked_domains")
-        UserDefaults.standard.set(websiteMode.rawValue, forKey: "lockin_website_mode")
+    // Actions
+    private func save() {
+        defaults.set(selectedApps, forKey: Key.apps); defaults.set(listMode.rawValue, forKey: Key.appMode)
+        defaults.set(blockedDomains, forKey: Key.domains); defaults.set(websiteMode.rawValue, forKey: Key.siteMode)
     }
 
-    func validate() {
-        let t = ((Int(hoursText) ?? 0) * 60) + (Int(minsText) ?? 0)
-        errorMessage = t < 1 ? "Invalid (min 1m)" : (t > 720 ? "Invalid (max 12h)" : nil)
-        if errorMessage == nil { totalMinutes = Double(t) }
+    private func validate() {
+        let total = ((Int(hoursText) ?? 0) * 60) + (Int(minsText) ?? 0)
+        errorMessage = total < 1 ? "Invalid (min 1m)" : (total > 720 ? "Invalid (max 12h)" : nil)
+        if errorMessage == nil { totalMinutes = Double(total) }
     }
 
-    func start() {
+    private func persist() {
+        SessionStore.save(SessionRecord(targetMono: targetMonotonicTime, wallEnd: wallEndTime,
+                                        total: sessionStartSeconds, config: lockedConfig))
+    }
+
+    private func beginBlocking() {
+        sessionIsLocked = true
+        PersistenceManager.installSupervisor()
+        BlockerEngine.shared.start(lockedConfig)
+    }
+
+    private func start() {
         NSApp.keyWindow?.makeFirstResponder(nil)
         validate()
         guard errorMessage == nil else { return }
-
         let secs = Int(totalMinutes * 60)
-        let nowMono = getMonotonicTime()
-        targetMonotonicTime = nowMono + Double(secs)
-
-        UserDefaults.standard.set(true, forKey: "lockin_is_locked")
-        UserDefaults.standard.set(targetMonotonicTime, forKey: "lockin_target_mono")
-        UserDefaults.standard.set(secs, forKey: "lockin_total_sec")
-        UserDefaults.standard.set(Date().timeIntervalSince1970 + Double(secs), forKey: "lockin_wall_end")
-
-        remainingSeconds = secs
-        sessionStartSeconds = secs
-        isLocked = true
-
-        PersistenceManager.installSupervisor()
-        BlockerEngine.shared.start(mode: listMode, apps: selectedApps, siteMode: websiteMode, sites: blockedDomains)
+        targetMonotonicTime = getMonotonicTime() + Double(secs)
+        wallEndTime = Date().timeIntervalSince1970 + Double(secs)
+        lockedConfig = config
+        remainingSeconds = secs; sessionStartSeconds = secs; isLocked = true
+        persist()
+        beginBlocking()
     }
 
-    func addTime() {
-        targetMonotonicTime += 900
-        UserDefaults.standard.set(targetMonotonicTime, forKey: "lockin_target_mono")
-        let currentWall = UserDefaults.standard.double(forKey: "lockin_wall_end")
-        UserDefaults.standard.set(currentWall + 900, forKey: "lockin_wall_end")
-        remainingSeconds = min(remainingSeconds + 900, 43200)
+    private func addTime() {
+        let extra = Limits.extensionSeconds
+        targetMonotonicTime += Double(extra)
+        wallEndTime += Double(extra)
+        remainingSeconds = min(remainingSeconds + extra, Limits.maxSeconds)
         sessionStartSeconds = max(sessionStartSeconds, remainingSeconds)
-        UserDefaults.standard.set(sessionStartSeconds, forKey: "lockin_total_sec")
+        persist()
     }
 
-    func endSession() {
-        isLocked = false
-        remainingSeconds = 0
-        UserDefaults.standard.set(false, forKey: "lockin_is_locked")
-        UserDefaults.standard.removeObject(forKey: "lockin_target_mono")
-        UserDefaults.standard.removeObject(forKey: "lockin_total_sec")
-        UserDefaults.standard.removeObject(forKey: "lockin_wall_end")
-        
+    private func endSession() {
+        isLocked = false; remainingSeconds = 0
+        sessionIsLocked = false
+        SessionStore.clear()
         PersistenceManager.removeSupervisor()
         BlockerEngine.shared.stop()
     }
 
-    func checkActiveSession() {
-        guard UserDefaults.standard.bool(forKey: "lockin_is_locked") else {
-            endSession()
-            return
-        }
-
-        let savedTotal = UserDefaults.standard.integer(forKey: "lockin_total_sec")
-        let savedMono = UserDefaults.standard.double(forKey: "lockin_target_mono")
+    /// Resumes a saved session on launch 
+    private func checkActiveSession() {
+        guard let saved = SessionStore.load() else { return endSession() }
         let nowMono = getMonotonicTime()
+        var left = Int(saved.targetMono - nowMono)
 
-        var left = Int(savedMono - nowMono)
-
-        if left < 0 || nowMono < (savedMono - Double(max(savedTotal, 1) + 3600)) {
-            let wallEnd = UserDefaults.standard.double(forKey: "lockin_wall_end")
-            left = Int(wallEnd - Date().timeIntervalSince1970)
+        // Clock reset (e.g. after reboot)
+        if left < 0 || nowMono < (saved.targetMono - Double(max(saved.total, 1) + 3600)) {
+            left = Int(saved.wallEnd - Date().timeIntervalSince1970)
             targetMonotonicTime = nowMono + Double(max(left, 0))
-            UserDefaults.standard.set(targetMonotonicTime, forKey: "lockin_target_mono")
         } else {
-            targetMonotonicTime = savedMono
+            targetMonotonicTime = saved.targetMono
         }
+        guard left > 0 else { return endSession() }
 
-        if left > 0 {
-            remainingSeconds = left
-            sessionStartSeconds = max(savedTotal, left)
-            isLocked = true
-            PersistenceManager.installSupervisor()
-            BlockerEngine.shared.start(mode: listMode, apps: selectedApps, siteMode: websiteMode, sites: blockedDomains)
+        wallEndTime = saved.wallEnd
+        lockedConfig = saved.config
+        listMode = saved.config.appMode; selectedApps = saved.config.apps
+        websiteMode = saved.config.siteMode; blockedDomains = saved.config.sites
+        remainingSeconds = left; sessionStartSeconds = max(saved.total, left); isLocked = true
+        persist()
+        beginBlocking()
+    }
+
+    private func tickCountdown() {
+        guard isLocked else { return }
+        let diff = Int(targetMonotonicTime - getMonotonicTime())
+        guard diff > 0 else { return endSession() }
+        remainingSeconds = diff
+        ticks += 1
+        if ticks % 3 == 0 { persist() }   
+    }
+
+    // Subviews
+    @ViewBuilder private var statusPill: some View {
+        if isLocked {
+            Text("Blocking").font(.system(size: 12, weight: .medium)).foregroundColor(.secondary).frame(width: 110, height: 24)
+                .background(Color.white.opacity(0.6)).cornerRadius(5)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.gray.opacity(0.2), lineWidth: 1)).padding(.top, 2)
         } else {
-            endSession()
+            Button("Start Blocking", action: start).buttonStyle(HoverBtn(disabled: errorMessage != nil, w: 110, h: 24, size: 12))
+                .disabled(errorMessage != nil).opacity(errorMessage != nil ? 0.6 : 1.0).padding(.top, 2)
         }
+    }
+
+    private var lockedProgress: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(countdownStr).font(.system(size: 13)).monospacedDigit().foregroundColor(Palette.textDark)
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.gray.opacity(0.25)).frame(height: 4)
+                    RoundedRectangle(cornerRadius: 2).fill(Palette.bar).frame(width: max(0, g.size.width * progressFraction), height: 4)
+                }
+            }.frame(height: 20)
+        }
+    }
+
+    private var timeInputs: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                HStack(spacing: 4) {
+                    TimeBox(text: $hoursText, hasError: errorMessage != nil, onChange: validate)
+                    Text(hoursText == "1" ? "hour" : "hours").font(.system(size: 12)).foregroundColor(Palette.textLabel)
+                }
+                HStack(spacing: 4) {
+                    TimeBox(text: $minsText, hasError: errorMessage != nil, onChange: validate)
+                    Text("minutes").font(.system(size: 12)).foregroundColor(Palette.textLabel)
+                }
+                if let err = errorMessage { Text(err).font(.system(size: 11, weight: .medium)).foregroundColor(.red).padding(.leading, 4) }
+                Spacer()
+            }
+            Slider(value: $totalMinutes, in: 1...720).accentColor(Palette.bar)
+                .onChange(of: totalMinutes) { _, v in
+                    let rounded = Int(v.rounded())
+                    hoursText = "\(rounded / 60)"; minsText = "\(rounded % 60)"; errorMessage = nil
+                }
+        }
+    }
+
+    private var footer: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Text(statusSummary).font(.system(size: 10)).foregroundColor(Palette.summary).lineLimit(2).minimumScaleFactor(0.75)
+            Spacer(minLength: 4)
+            HStack(spacing: 6) {
+                Button("Apps") { showApps = true }.buttonStyle(HoverBtn(disabled: isLocked)).disabled(isLocked)
+                Button("Sites") { showSites = true }.buttonStyle(HoverBtn(disabled: isLocked)).disabled(isLocked)
+            }
+        }.frame(height: 42)
+    }
+
+    private var extendButton: some View {
+        let atMax = remainingSeconds >= Limits.maxSeconds
+        return Button("+ 15m", action: addTime).buttonStyle(HoverBtn(disabled: atMax, size: 11, bold: true))
+            .padding([.top, .trailing], 10).disabled(atMax)
     }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            Color(red: 0.90, green: 0.90, blue: 0.91)
-                .contentShape(Rectangle())
-                .onTapGesture { NSApp.keyWindow?.makeFirstResponder(nil) }
-
+            Palette.background.contentShape(Rectangle()).onTapGesture { NSApp.keyWindow?.makeFirstResponder(nil) }
             VStack(spacing: 12) {
-                if isLocked {
-                    Text("Blocking").font(.system(size: 12, weight: .medium)).foregroundColor(.secondary).frame(width: 110, height: 24)
-                        .background(Color.white.opacity(0.6)).cornerRadius(5).overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.gray.opacity(0.2), lineWidth: 1)).padding(.top, 2)
-                } else {
-                    Button("Start Blocking", action: start).buttonStyle(HoverBtn(disabled: errorMessage != nil, w: 110, h: 24, size: 12))
-                        .disabled(errorMessage != nil).opacity(errorMessage != nil ? 0.6 : 1.0).padding(.top, 2)
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    if isLocked {
-                        Text(countdownStr).font(.system(size: 13)).monospacedDigit().foregroundColor(Color(red: 0.15, green: 0.15, blue: 0.15))
-                        GeometryReader { g in
-                            ZStack(alignment: .leading) {
-                                RoundedRectangle(cornerRadius: 2).fill(Color.gray.opacity(0.25)).frame(height: 4)
-                                RoundedRectangle(cornerRadius: 2).fill(Color(red: 0.25, green: 0.25, blue: 0.25))
-                                    .frame(width: max(0, g.size.width * progressFraction), height: 4)
-                            }
-                        }.frame(height: 20)
-                    } else {
-                        HStack(spacing: 6) {
-                            HStack(spacing: 4) {
-                                TimeBox(text: $hoursText, hasError: errorMessage != nil, onChange: validate)
-                                Text(hoursText == "1" ? "hour" : "hours").font(.system(size: 12)).foregroundColor(Color(red: 0.2, green: 0.2, blue: 0.2))
-                            }
-                            HStack(spacing: 4) {
-                                TimeBox(text: $minsText, hasError: errorMessage != nil, onChange: validate)
-                                Text("minutes").font(.system(size: 12)).foregroundColor(Color(red: 0.2, green: 0.2, blue: 0.2))
-                            }
-                            if let err = errorMessage { Text(err).font(.system(size: 11, weight: .medium)).foregroundColor(.red).padding(.leading, 4) }
-                            Spacer()
-                        }
-
-                        Slider(value: $totalMinutes, in: 1...720)
-                            .accentColor(Color(red: 0.25, green: 0.25, blue: 0.25))
-                            .onChange(of: totalMinutes) { _, v in
-                                let rounded = Int(v.rounded())
-                                hoursText = "\(rounded / 60)"
-                                minsText = "\(rounded % 60)"
-                                errorMessage = nil
-                            }
-                    }
-                }
-
+                statusPill
+                if isLocked { lockedProgress } else { timeInputs }
                 Spacer(minLength: 2)
-
-                HStack(alignment: .center, spacing: 10) {
-                    Text(statusSummary).font(.system(size: 10)).foregroundColor(Color(red: 0.35, green: 0.35, blue: 0.35)).lineLimit(2).minimumScaleFactor(0.75)
-                    Spacer(minLength: 4)
-                    HStack(spacing: 6) {
-                        Button("Apps") { showApps = true }.buttonStyle(HoverBtn(disabled: isLocked)).disabled(isLocked)
-                        Button("Sites") { showSites = true }.buttonStyle(HoverBtn(disabled: isLocked)).disabled(isLocked)
-                    }
-                }.frame(height: 42)
-            }
-            .padding(.horizontal, 22)
-            .padding(.vertical, 14)
-
-            if isLocked {
-                Button("+ 15m", action: addTime)
-                    .buttonStyle(HoverBtn(disabled: remainingSeconds >= 43200, size: 11, bold: true))
-                    .padding([.top, .trailing], 10)
-                    .disabled(remainingSeconds >= 43200)
-            }
+                footer
+            }.padding(.horizontal, 22).padding(.vertical, 14)
+            if isLocked { extendButton }
         }
         .frame(width: 500, height: 175)
         .background(WindowAccessor(isLocked: isLocked))
         .onAppear { checkActiveSession() }
+        .onReceive(timer) { _ in tickCountdown() }
         .sheet(isPresented: $showApps) {
-            ListEditorSheet(title: "Manage Apps", placeholder: "", subtitle: { $0 == .blocklist ? "Blocklist: unapproved apps will be blocked." : "Allowlist: only chosen apps will be allowed." }, isPresented: $showApps, mode: $listMode, items: $selectedApps, onSave: save)
+            ListEditorSheet(title: "Manage Apps", placeholder: "",
+                subtitle: { $0 == .blocklist ? "Blocklist: unapproved apps will be blocked." : "Allowlist: only chosen apps will be allowed." },
+                isPresented: $showApps, mode: $listMode, items: $selectedApps, onSave: save)
         }
         .sheet(isPresented: $showSites) {
-            ListEditorSheet(title: "Manage Websites", placeholder: "e.g. youtube.com", subtitle: { $0 == .blocklist ? "Blocklist: Tabs with these domains will be closed." : "Allowlist: Only tabs with these domains will stay open." }, isPresented: $showSites, mode: $websiteMode, items: $blockedDomains, isWeb: true, onSave: save)
-        }
-        .onReceive(timer) { _ in
-            guard isLocked else { return }
-            let nowMono = getMonotonicTime()
-            let diff = Int(targetMonotonicTime - nowMono)
-            if diff > 0 {
-                remainingSeconds = diff
-            } else {
-                endSession()
-            }
+            ListEditorSheet(title: "Manage Websites", placeholder: "e.g. youtube.com",
+                subtitle: { $0 == .blocklist ? "Blocklist: Tabs with these domains will be closed." : "Allowlist: Only tabs with these domains will stay open." },
+                isPresented: $showSites, mode: $websiteMode, items: $blockedDomains, isWeb: true, onSave: save)
         }
     }
 }
 
-// Entry Point
+private func enforceSingleInstance() {
+    let myPID = ProcessInfo.processInfo.processIdentifier
+    guard let myExecutable = Bundle.main.executableURL?.standardizedFileURL else { return }
+    let others = NSWorkspace.shared.runningApplications.filter {
+        $0.processIdentifier != myPID && $0.executableURL?.standardizedFileURL == myExecutable
+    }
+    guard let existing = others.first else { return }
+    if getppid() == 1 { others.forEach { $0.forceTerminate() } } else { existing.activate(); exit(0) }
+}
+
+private func showAboutPanel() {
+    let text = NSMutableAttributedString(string: "By Lucas H\n\n")
+    text.append(NSAttributedString(string: "GitHub Repository", attributes: [
+        .link: URL(string: "https://github.com/sigma-prog/lockin")!, .underlineStyle: NSUnderlineStyle.single.rawValue]))
+    NSApplication.shared.orderFrontStandardAboutPanel(options: [.credits: text])
+}
+
 @main
 struct LockinApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     init() {
-        // Single-Instance Guard: Prevents duplicate windows
-        let myPID = ProcessInfo.processInfo.processIdentifier
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.lockin.app"
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-            .filter { $0.processIdentifier != myPID }
-
-        if let existing = others.first {
-            if getppid() == 1 {
-                // This instance was launched by launchd to supervise:
-                // Kill the old un-supervised window so only this one remains!
-                for other in others {
-                    other.forceTerminate()
-                }
-            } else {
-                // User accidentally opened a second copy: focus the existing one and exit
-                existing.activate()
-                exit(0)
-            }
-        }
-
+        enforceSingleInstance()
         NSApplication.shared.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-        .windowResizability(.contentSize)
-        .commands {
-            CommandGroup(replacing: .appInfo) {
-                Button("About Lockin") {
-                    let text = NSMutableAttributedString(string: "By Lucas H\n\n")
-                    let link = NSAttributedString(string: "GitHub Repository", attributes: [
-                        .link: URL(string: "https://github.com/sigma-prog/lockin")!,
-                        .underlineStyle: NSUnderlineStyle.single.rawValue
-                    ])
-                    text.append(link)
-                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
-                        .credits: text
-                    ])
-                }
-            }
-        }
+        WindowGroup { ContentView() }
+            .windowResizability(.contentSize)
+            .commands { CommandGroup(replacing: .appInfo) { Button("About Lockin", action: showAboutPanel) } }
     }
 }
